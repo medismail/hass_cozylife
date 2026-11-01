@@ -1,0 +1,359 @@
+"""Expose device-backed countdown controls for CozyLife devices."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime, timedelta
+import math
+from time import monotonic
+
+from homeassistant.components.number import (
+    NumberDeviceClass,
+    NumberEntity,
+    NumberMode,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfTime
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
+
+from . import register_device_callback
+from .const import (
+    LIGHT_COUNTDOWN,
+    LIGHT_TYPE_CODE,
+    MOTOR_COUNTDOWN,
+    MOTOR_TYPE_CODE,
+    SWITCH_COUNTDOWN,
+    SWITCH_TYPE_CODE,
+)
+from .device import CozyLifeDevice
+from .tcp_client import DeviceCommandRejectedError
+
+
+COUNTDOWN_TICK_INTERVAL = timedelta(seconds=1)
+COUNTDOWN_CALIBRATION_INTERVAL = timedelta(seconds=10)
+_COUNTDOWN_DEVICE_CONFIG = {
+    LIGHT_TYPE_CODE: (LIGHT_COUNTDOWN, "Countdown"),
+    SWITCH_TYPE_CODE: (SWITCH_COUNTDOWN, "Countdown 1"),
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add countdown controls for registered devices with matching capabilities."""
+    from .motor import CozyLifeMotorCountdown
+
+    def add_device(device: CozyLifeDevice) -> None:
+        entity = None
+        if device.device_type_code == MOTOR_TYPE_CODE:
+            if int(MOTOR_COUNTDOWN) in device.dpid:
+                entity = CozyLifeMotorCountdown(device)
+        elif (
+            countdown_config := _COUNTDOWN_DEVICE_CONFIG.get(
+                device.device_type_code
+            )
+        ) is not None:
+            dp_id, label_suffix = countdown_config
+            if int(dp_id) in device.dpid:
+                entity = CozyLifeCountdown(device, dp_id, label_suffix)
+        if entity is not None:
+            hass.loop.call_soon_threadsafe(async_add_entities, [entity])
+
+    register_device_callback(entry.runtime_data, add_device)
+
+
+class CozyLifeCountdown(NumberEntity):
+    """Represent a device-local countdown in seconds."""
+
+    _attr_device_class = NumberDeviceClass.DURATION
+    _attr_mode = NumberMode.BOX
+    _attr_native_max_value = 86400
+    _attr_native_min_value = 0
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    # Device state messages must refresh Home Assistant's last_updated value.
+    _attr_force_update = True
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        device: CozyLifeDevice,
+        dp_id: str,
+        label_suffix: str,
+    ) -> None:
+        """Initialize one countdown variant without device input or output."""
+        self._device = device
+        self._attr_device_info = device.device_info
+        self._dp_id = dp_id
+        self._countdown_deadline: float | None = None
+        self._state_updates_active = False
+        self._initial_query_complete = False
+        self._cancel_countdown_tick: Callable[[], None] | None = None
+        self._cancel_countdown_calibration: Callable[[], None] | None = None
+        self._remove_state_callback: Callable[[], None] | None = None
+        self._attr_name = (
+            f"{device.device_model_name} {device.device_id[-4:]} "
+            f"{label_suffix}"
+        )
+        unique_id_suffix = label_suffix.lower().replace(" ", "_")
+        self._attr_unique_id = f"{device.device_id}_{unique_id_suffix}"
+        self._attr_available = False
+        self._attr_native_value = 0
+
+    def _query_countdown_state(self) -> dict:
+        """Query the countdown data point without changing entity state."""
+        return self._device.query([int(self._dp_id)])
+
+    def _apply_countdown_query(self, state: dict) -> None:
+        """Apply one device query result on the owning execution context."""
+        if self._dp_id not in state:
+            self._attr_available = False
+            self._countdown_deadline = None
+            return
+
+        countdown_seconds = self._parse_countdown_seconds(
+            state[self._dp_id]
+        )
+        if countdown_seconds is None:
+            self._attr_available = False
+            self._countdown_deadline = None
+            self._stop_countdown_updates()
+            return
+
+        self._set_countdown_state(countdown_seconds)
+        self._attr_available = True
+
+    def _apply_current_countdown_query_failure(
+        self,
+        state: dict,
+        sequence_number_before_query: int | None,
+    ) -> bool:
+        """Apply an empty query only when no newer state arrived meanwhile."""
+        if (
+            self._dp_id in state
+            or self._device.last_state_sequence_number
+            != sequence_number_before_query
+        ):
+            return False
+        self._apply_countdown_query(state)
+        self._sync_countdown_updates()
+        return True
+
+    def _parse_countdown_seconds(self, value: object) -> int | None:
+        """Validate one device countdown value against the entity contract."""
+        if isinstance(value, bool):
+            return None
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+            return None
+        countdown_seconds = int(numeric_value)
+        if not (
+            self.native_min_value
+            <= countdown_seconds
+            <= self.native_max_value
+        ):
+            return None
+        return countdown_seconds
+
+    def _set_countdown_state(self, countdown_seconds: int) -> None:
+        """Cache device seconds and derive a monotonic local deadline."""
+        self._attr_native_value = countdown_seconds
+        self._countdown_deadline = (
+            monotonic() + countdown_seconds if countdown_seconds > 0 else None
+        )
+
+    def _sync_countdown_updates(self) -> None:
+        """Match local tick and device calibration tasks to entity state."""
+        if not self._state_updates_active:
+            self._stop_countdown_updates()
+            return
+
+        should_tick = self.available and self._countdown_deadline is not None
+        if should_tick and self._cancel_countdown_tick is None:
+            self._cancel_countdown_tick = async_track_time_interval(
+                self.hass,
+                self._handle_countdown_tick,
+                COUNTDOWN_TICK_INTERVAL,
+            )
+        elif not should_tick:
+            self._stop_countdown_tick()
+
+        # Keep probing at zero so idle devices can publish connection failures.
+        if self._cancel_countdown_calibration is None:
+            self._cancel_countdown_calibration = async_track_time_interval(
+                self.hass,
+                self._async_calibrate_countdown,
+                COUNTDOWN_CALIBRATION_INTERVAL,
+            )
+
+    def _stop_countdown_tick(self) -> None:
+        """Cancel the local one-second countdown task, if active."""
+        if self._cancel_countdown_tick is not None:
+            self._cancel_countdown_tick()
+            self._cancel_countdown_tick = None
+
+    def _stop_countdown_calibration(self) -> None:
+        """Cancel the ten-second device calibration task, if active."""
+        if self._cancel_countdown_calibration is not None:
+            self._cancel_countdown_calibration()
+            self._cancel_countdown_calibration = None
+
+    def _stop_countdown_updates(self) -> None:
+        """Cancel local tick and device calibration tasks, if active."""
+        self._stop_countdown_tick()
+        self._stop_countdown_calibration()
+
+    def _handle_state_report(
+        self, state: dict, sequence_number: int
+    ) -> None:
+        """Move countdown state from the network thread to the event loop."""
+        if self._dp_id in state and self.hass is not None:
+            self.hass.loop.call_soon_threadsafe(
+                self._apply_countdown_report,
+                state[self._dp_id],
+                sequence_number,
+            )
+
+    def _apply_countdown_report(
+        self,
+        value: int,
+        sequence_number: int,
+    ) -> None:
+        """Apply one non-stale countdown state message."""
+        if not self._state_updates_active:
+            return
+        latest_sequence_number = self._device.last_state_sequence_number
+        if (
+            latest_sequence_number is not None
+            and sequence_number < latest_sequence_number
+        ):
+            return
+        countdown_seconds = self._parse_countdown_seconds(value)
+        if countdown_seconds is None:
+            self._attr_available = False
+            self._countdown_deadline = None
+            self._stop_countdown_updates()
+            if self._initial_query_complete:
+                self.async_write_ha_state()
+            return
+        self._set_countdown_state(countdown_seconds)
+        self._attr_available = True
+        self._sync_countdown_updates()
+        if self._initial_query_complete:
+            self.async_write_ha_state()
+
+    async def _async_calibrate_countdown(self, _now: datetime) -> None:
+        """Query the countdown off the event loop and publish calibration."""
+        if not self._state_updates_active:
+            return
+        sequence_number_before_query = (
+            self._device.last_state_sequence_number
+        )
+        state = await self.hass.async_add_executor_job(
+            self._query_countdown_state
+        )
+        if not self._state_updates_active:
+            return
+        if self._apply_current_countdown_query_failure(
+            state, sequence_number_before_query
+        ):
+            self.async_write_ha_state()
+
+    @callback
+    def _handle_countdown_tick(self, _now: datetime) -> None:
+        """Publish locally calculated seconds without querying the device."""
+        if not self._state_updates_active:
+            self._stop_countdown_updates()
+            return
+        if not self.available or self._countdown_deadline is None:
+            self._stop_countdown_tick()
+            self._sync_countdown_updates()
+            return
+
+        remaining = max(0, math.ceil(self._countdown_deadline - monotonic()))
+        if remaining != self._attr_native_value:
+            self._attr_native_value = remaining
+            self.async_write_ha_state()
+
+        if remaining == 0:
+            self._countdown_deadline = None
+            self._sync_countdown_updates()
+
+    async def async_added_to_hass(self) -> None:
+        """Start local updates after Home Assistant owns the entity."""
+        await super().async_added_to_hass()
+        self._state_updates_active = True
+        self._remove_state_callback = self._device.add_state_callback(
+            self._handle_state_report
+        )
+        sequence_number_before_query = (
+            self._device.last_state_sequence_number
+        )
+        state = await self.hass.async_add_executor_job(
+            self._query_countdown_state
+        )
+        if self._state_updates_active:
+            self._apply_current_countdown_query_failure(
+                state, sequence_number_before_query
+            )
+            self._initial_query_complete = True
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop local updates before Home Assistant removes the entity."""
+        self._state_updates_active = False
+        if self._remove_state_callback is not None:
+            self._remove_state_callback()
+            self._remove_state_callback = None
+        self._stop_countdown_updates()
+        await super().async_will_remove_from_hass()
+
+    async def async_update(self) -> None:
+        """Refresh the countdown without worker-thread state changes."""
+        if not self._state_updates_active:
+            return
+        sequence_number_before_query = (
+            self._device.last_state_sequence_number
+        )
+        state = await self.hass.async_add_executor_job(
+            self._query_countdown_state
+        )
+        if not self._state_updates_active:
+            return
+        self._apply_current_countdown_query_failure(
+            state, sequence_number_before_query
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Set or cancel the device-local countdown on the event loop."""
+        countdown_seconds = self._parse_countdown_seconds(value)
+        if countdown_seconds is None:
+            raise HomeAssistantError(
+                "Countdown must be a whole number from 0 to 86400 seconds"
+            )
+
+        try:
+            control_succeeded = await self.hass.async_add_executor_job(
+                self._device.control,
+                {self._dp_id: countdown_seconds},
+            )
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected countdown command"
+            ) from err
+
+        if not control_succeeded:
+            self._attr_available = False
+            self._countdown_deadline = None
+            self._sync_countdown_updates()
+            self.async_write_ha_state()
+            raise HomeAssistantError(
+                "Unable to send countdown command to CozyLife device"
+            )
